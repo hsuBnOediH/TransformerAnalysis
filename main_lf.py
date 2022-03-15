@@ -12,7 +12,7 @@ from transformers import BartConfig, AdamW
 from model_bart import BartForConditionalGeneration
 
 IS_DEBUG = True
-RELOAD_DATA = True
+RELOAD_DATA = False
 DATASET = "TED"
 SRC_LANG = "en"
 TGT_LANG = "de"
@@ -41,6 +41,28 @@ TGT_TEST_PATH = DATA_PATH + "test." + TGT_LANG
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+
+def self_collate_fn(batch):
+    batch_max_length = min(MAX_LENGTH, max(data["encoder_input_id"].size for data in batch))
+    for data in batch:
+        encoder_input_id = data["encoder_input_id"]
+        encoder_attention_mask = data["encoder_attention_mask"]
+        decoder_input_id = data["decoder_input_id"]
+        decoder_attention_mask = data["decoder_attention_mask"]
+        label_id = data["label_id"]
+        while len(encoder_input_id) < batch_max_length:
+            # encoder_tokens.append("[PAD]")
+            encoder_input_id.append(0)
+            encoder_attention_mask.append(0)
+        while len(decoder_input_id) < batch_max_length:
+            # decoder_tokens.append("[PAD]")
+            decoder_input_id.append(0)
+            decoder_attention_mask.append(0)
+            label_id.append(-100)
+
+    return {
+
+    }
 
 def _get_ngrams(segment, max_order):
     """Extracts all n-grams upto a given maximum order from an input segment.
@@ -194,15 +216,7 @@ def process_data(source_file_path, target_file_path, word_to_ids,reload_data = F
                 if len(encoder_input_id) > MAX_LENGTH or len(decoder_input_id) > MAX_LENGTH:
                     continue
 
-                while len(encoder_input_id) < MAX_LENGTH:
-                    # encoder_tokens.append("[PAD]")
-                    encoder_input_id.append(0)
-                    encoder_attention_mask.append(0)
-                while len(decoder_input_id) < MAX_LENGTH:
-                    # decoder_tokens.append("[PAD]")
-                    decoder_input_id.append(0)
-                    decoder_attention_mask.append(0)
-                    label_id.append(-100)
+
                 dataset.append({
                     "encoder_input_id": np.array(encoder_input_id),
                     "encoder_attention_mask": np.array(encoder_attention_mask),
@@ -366,7 +380,7 @@ def eval_the_model(model, test_data_loader, ids_to_words, toy_test_dataloader=No
 
 words_to_ids, ids_to_words = get_vocab(VOCAB_PATH)
 train_dataset = process_data(SRC_TRAIN_PATH, TGT_TRAIN_PATH, words_to_ids,reload_data=RELOAD_DATA)
-train_data_loader = DataLoader(dataset=MTDataset(train_dataset), shuffle=True, batch_size=BATCH_SIZE, pin_memory=True)
+train_data_loader = DataLoader(dataset=MTDataset(train_dataset), shuffle=True, batch_size=BATCH_SIZE, pin_memory=True,collate_fn=self_collate_fn)
 test_dataset = process_data(SRC_TEST_PATH, TGT_TEST_PATH, words_to_ids,reload_data=RELOAD_DATA)
 test_data_loader = DataLoader(dataset=MTDataset(test_dataset), shuffle=True, batch_size=BATCH_SIZE, pin_memory=True)
 toy_test_dataset = test_dataset[:20]
