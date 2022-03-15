@@ -12,7 +12,7 @@ from transformers import BartConfig, AdamW
 from model_bart import BartForConditionalGeneration
 
 IS_DEBUG = True
-RELOAD_DATA = True
+RELOAD_DATA = False
 DATASET = "TED"
 SRC_LANG = "en"
 TGT_LANG = "de"
@@ -264,7 +264,6 @@ def eval_the_model(model, test_data_loader, ids_to_words, toy_test_dataloader=No
     START_OF_SENTENCE = 1
     h_l = []
     y_l = []
-    the_test_index = 0
     if is_debug:
         with torch.no_grad():
             model.eval()
@@ -295,7 +294,6 @@ def eval_the_model(model, test_data_loader, ids_to_words, toy_test_dataloader=No
                     for _id in predict[1:]:
                         predict_tokens.append(ids_to_words[_id])
                     predict_str = " ".join(predict_tokens)
-                    # TODO: what?
                     predict_str = predict_str.replace("@@ ", "")
 
                     target = label_id[i]
@@ -309,10 +307,7 @@ def eval_the_model(model, test_data_loader, ids_to_words, toy_test_dataloader=No
                     target_str = target_str.replace("@@ ", "")
 
                     h_l.append(predict_str.split())
-                    y_l.append(target_str.split())
-                the_test_index += 1
-                if the_test_index == 5:
-                    break
+                    y_l.append([target_str.split()])
         model.train()
         score = float(compute_bleu(y_l, h_l, 4, False)[0])
         print(f"bleu score: {score}")
