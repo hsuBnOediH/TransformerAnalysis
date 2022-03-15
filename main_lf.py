@@ -11,11 +11,13 @@ from transformers import BartConfig, AdamW
 
 from model_bart import BartForConditionalGeneration
 
+IS_DEBUG = True
+RELOAD_DATA = True
 DATASET = "TED"
 SRC_LANG = "en"
 TGT_LANG = "de"
 MAX_LENGTH = 128
-BATCH_SIZE = 2
+BATCH_SIZE = 2 if IS_DEBUG else 16
 EMBEDDING_SIZE = 512
 ENCODER_LAYER = 6
 DECODER_LAYER = 6
@@ -25,11 +27,10 @@ ENCODE_FFN_DIM = 2048
 DECODER_FFN_DIM = 2048
 DROPOUT = 0.3
 LR = 0.0005
-# TODO? Why 104?
 MAX_POS_EMBEDDING = 128
 WARMUP_STEPS = 4000
-PRINT_STEP = 200
-EVAL_STEP = 1000
+PRINT_STEP = 10 if IS_DEBUG else 100
+EVAL_STEP = 10 if IS_DEBUG else 1000
 
 DATA_PATH = "data/" + DATASET + "/"
 VOCAB_PATH = DATA_PATH + "vocab"
@@ -96,7 +97,6 @@ def compute_bleu(reference_corpus, translation_corpus, max_order=4,
 
     precisions = [0] * max_order
     for i in range(0, max_order):
-        # Why Smooth?
         if smooth:
             precisions[i] = ((matches_by_order[i] + 1.) /
                              (possible_matches_by_order[i] + 1.))
@@ -112,20 +112,15 @@ def compute_bleu(reference_corpus, translation_corpus, max_order=4,
         geo_mean = math.exp(p_log_sum)
     else:
         geo_mean = 0
-
     ratio = float(translation_length) / reference_length
-
     if ratio > 1.0:
         bp = 1.
     else:
         bp = math.exp(1 - 1. / ratio)
-
     bleu = geo_mean * bp
-
     return bleu, precisions, bp, ratio, translation_length, reference_length
 
-
-def get_vocab(vocab_file_path):
+def get_vocab(VOCAB_PATH):
     v2id = {}
     id2v = {}
     with open(VOCAB_PATH, "r", encoding="utf-8") as fr:
@@ -137,12 +132,12 @@ def get_vocab(vocab_file_path):
     return v2id, id2v
 
 
-def process_data(source_file_path, target_file_path, word_to_ids):
+def process_data(source_file_path, target_file_path, word_to_ids,reload_data = False):
     dataset = []
     pickle_file_name = source_file_path.split('/')[-1].split('.')[0]
     pickle_file_path = DATA_PATH + pickle_file_name + "_cache"
 
-    if os.path.exists(pickle_file_path):
+    if os.path.exists(pickle_file_path) and not reload_data:
         with open(pickle_file_path, "rb") as fr:
             dataset = pickle.load(fr)
             return dataset
@@ -186,14 +181,15 @@ def process_data(source_file_path, target_file_path, word_to_ids):
                         continue
                     decoder_input_id.append(word_to_ids[token])
 
-                # TODO: the last token not need to be input into model
-                decoder_input_id = decoder_input_id[1:]
+                # the last token not need to be input into model
+                last_token = decoder_input_id[-1]
+                decoder_input_id = decoder_input_id[:-1]
 
                 encoder_attention_mask = [1 for _ in encoder_input_id]
                 decoder_attention_mask = [1 for _ in decoder_input_id]
-                # TODO: the first token of decoder don't need to be predicted
-                # label_id = decoder_input_id[1:]
-                label_id = decoder_input_id[:]
+                # the first token of decoder don't need to be predicted
+                label_id = decoder_input_id[1:]
+                label_id.append(last_token)
 
                 if len(encoder_input_id) > MAX_LENGTH or len(decoder_input_id) > MAX_LENGTH:
                     continue
@@ -206,7 +202,6 @@ def process_data(source_file_path, target_file_path, word_to_ids):
                     # decoder_tokens.append("[PAD]")
                     decoder_input_id.append(0)
                     decoder_attention_mask.append(0)
-                    # TODO? meaning end?
                     label_id.append(-100)
                 dataset.append({
                     "encoder_input_id": np.array(encoder_input_id),
@@ -229,6 +224,11 @@ class MTDataset(Dataset):
 
     def __len__(self):
         return len(self.dataset)
+
+    #TODO collect fn torch Dataset bucketing batch op
+
+
+
 
 
 class ReverseSqrtScheduler:
@@ -259,71 +259,119 @@ class ReverseSqrtScheduler:
             param_group['lr'] = lr[i]
 
 
-def eval_the_model(model, test_data_loader, ids_to_words):
+def eval_the_model(model, test_data_loader, ids_to_words, toy_test_dataloader=None, is_debug=False):
     END_OF_SENTENCE = 2
     START_OF_SENTENCE = 1
     h_l = []
     y_l = []
-    the_test_index= 0
-    with torch.no_grad():
-        model.eval()
+    the_test_index = 0
+    if is_debug:
+        with torch.no_grad():
+            model.eval()
 
-        for batch in tqdm(test_data_loader):
-            encoder_input_id = batch["encoder_input_id"].to(device)
-            encoder_attention_mask = batch["encoder_attention_mask"].to(device)
-            decoder_input_id = batch["decoder_input_id"].to(device)
-            decoder_attention_mask = batch["decoder_attention_mask"].to(device)
-            label_id = batch["label_id"].to(device)
+            for batch in tqdm(toy_test_dataloader):
+                encoder_input_id = batch["encoder_input_id"].to(device)
+                encoder_attention_mask = batch["encoder_attention_mask"].to(device)
+                label_id = batch["label_id"].to(device)
 
-            outputs = model.generate(
-                input_ids=encoder_input_id,
-                attention_mask=encoder_attention_mask,
-                bos_token_id=START_OF_SENTENCE,
-                num_return_sequences=1,
-                num_beams=5,
-                max_length=MAX_LENGTH,
-                use_cache=True
-            )
-            outputs = outputs.to("cpu").tolist()
-            assert len(outputs) == len(label_id)
+                outputs = model.generate(
+                    input_ids=encoder_input_id,
+                    attention_mask=encoder_attention_mask,
+                    bos_token_id=START_OF_SENTENCE,
+                    num_return_sequences=1,
+                    num_beams=5,
+                    max_length=MAX_LENGTH,
+                    use_cache=True
+                )
+                outputs = outputs.to("cpu").tolist()
+                assert len(outputs) == len(label_id)
 
-            for i in range(len(outputs)):
-                predict = outputs[i]
-                if END_OF_SENTENCE in predict:
-                    index = predict.index(END_OF_SENTENCE)
-                    predict = predict[:index]
-                predict_tokens = []
-                for _id in predict[1:]:
-                    predict_tokens.append(ids_to_words[_id])
-                predict_str = " ".join(predict_tokens)
+                for i in range(len(outputs)):
+                    predict = outputs[i]
+                    if END_OF_SENTENCE in predict:
+                        index = predict.index(END_OF_SENTENCE)
+                        predict = predict[:index]
+                    predict_tokens = []
+                    for _id in predict[1:]:
+                        predict_tokens.append(ids_to_words[_id])
+                    predict_str = " ".join(predict_tokens)
                     # TODO: what?
-                predict_str = predict_str.replace("@@", "")
+                    predict_str = predict_str.replace("@@ ", "")
 
-                target = label_id[i]
-                target = target.to("cpu").tolist()
-                index = target.index(END_OF_SENTENCE)
-                target = target[:index]
-                target_tokens = []
-                for _id in target:
-                    target_tokens.append(ids_to_words[_id])
-                target_str = " ".join(target_tokens)
-                target_str = target_str.replace("@@", "")
+                    target = label_id[i]
+                    target = target.to("cpu").tolist()
+                    index = target.index(END_OF_SENTENCE)
+                    target = target[:index]
+                    target_tokens = []
+                    for _id in target:
+                        target_tokens.append(ids_to_words[_id])
+                    target_str = " ".join(target_tokens)
+                    target_str = target_str.replace("@@ ", "")
 
-                h_l.append(predict_str.split())
-                y_l.append(target_str.split())
-            the_test_index += 1
-            if the_test_index == 5:
-                break
-    model.train()
-    score = float(compute_bleu(y_l, h_l, 4, False)[0])
-    print(f"bleu score: {score}")
+                    h_l.append(predict_str.split())
+                    y_l.append(target_str.split())
+                the_test_index += 1
+                if the_test_index == 5:
+                    break
+        model.train()
+        score = float(compute_bleu(y_l, h_l, 4, False)[0])
+        print(f"bleu score: {score}")
+    else:
+        with torch.no_grad():
+            model.eval()
+            for batch in tqdm(test_data_loader):
+                encoder_input_id = batch["encoder_input_id"].to(device)
+                encoder_attention_mask = batch["encoder_attention_mask"].to(device)
+                label_id = batch["label_id"].to(device)
+
+                outputs = model.generate(
+                    input_ids=encoder_input_id,
+                    attention_mask=encoder_attention_mask,
+                    bos_token_id=START_OF_SENTENCE,
+                    num_return_sequences=1,
+                    num_beams=5,
+                    max_length=MAX_LENGTH,
+                    use_cache=True
+                )
+                outputs = outputs.to("cpu").tolist()
+                assert len(outputs) == len(label_id)
+
+                for i in range(len(outputs)):
+                    predict = outputs[i]
+                    if END_OF_SENTENCE in predict:
+                        index = predict.index(END_OF_SENTENCE)
+                        predict = predict[:index]
+                    predict_tokens = []
+                    for _id in predict[1:]:
+                        predict_tokens.append(ids_to_words[_id])
+                    predict_str = " ".join(predict_tokens)
+                    predict_str = predict_str.replace("@@", "")
+
+                    target = label_id[i]
+                    target = target.to("cpu").tolist()
+                    index = target.index(END_OF_SENTENCE)
+                    target = target[:index]
+                    target_tokens = []
+                    for _id in target:
+                        target_tokens.append(ids_to_words[_id])
+                    target_str = " ".join(target_tokens)
+                    target_str = target_str.replace("@@", "")
+
+                    h_l.append(predict_str.split())
+                    y_l.append(target_str.split())
+        model.train()
+        score = float(compute_bleu(y_l, h_l, 4, False)[0])
+        print(f"bleu score: {score}")
 
 
 words_to_ids, ids_to_words = get_vocab(VOCAB_PATH)
-train_dataset = process_data(SRC_TRAIN_PATH, TGT_TRAIN_PATH, words_to_ids)
+train_dataset = process_data(SRC_TRAIN_PATH, TGT_TRAIN_PATH, words_to_ids,reload_data=RELOAD_DATA)
 train_data_loader = DataLoader(dataset=MTDataset(train_dataset), shuffle=True, batch_size=BATCH_SIZE, pin_memory=True)
-test_dataset = process_data(SRC_TEST_PATH, TGT_TEST_PATH, words_to_ids)
+test_dataset = process_data(SRC_TEST_PATH, TGT_TEST_PATH, words_to_ids,reload_data=RELOAD_DATA)
 test_data_loader = DataLoader(dataset=MTDataset(test_dataset), shuffle=True, batch_size=BATCH_SIZE, pin_memory=True)
+toy_test_dataset = test_dataset[:20]
+toy_test_dataloader = DataLoader(dataset=MTDataset(toy_test_dataset), shuffle=True, batch_size=BATCH_SIZE,
+                                 pin_memory=True)
 config = BartConfig(
     vocab_size=len(words_to_ids),
     d_model=EMBEDDING_SIZE,
@@ -345,7 +393,6 @@ config = BartConfig(
 model = BartForConditionalGeneration(config)
 model.to(device)
 
-# TODO Beta?
 optimizer = AdamW(model.parameters(), lr=LR, betas=(0.9, 0.98))
 scheduler = ReverseSqrtScheduler(optimizer, [LR], WARMUP_STEPS)
 for epoch in range(0, 100):
@@ -386,9 +433,6 @@ for epoch in range(0, 100):
         if update_step % PRINT_STEP == 0:
             print(f"loss: {total_loss / update_step}")
         if update_step % EVAL_STEP == 0:
-            eval_the_model(model, test_data_loader, ids_to_words)
-
+            eval_the_model(model, test_data_loader, ids_to_words, toy_test_dataloader,is_debug=IS_DEBUG )
 
     eval_the_model(model, test_data_loader, ids_to_words)
-
-
