@@ -263,6 +263,7 @@ class ReverseSqrtScheduler:
             param_group['lr'] = lr[i]
 
 
+
 def eval_the_model(model, test_dataloader, ids_to_words):
     eos = 2  # tokenizer.sep_token_id
     sos = 1  # tokenizer.cls_token_id
@@ -317,7 +318,6 @@ def eval_the_model(model, test_dataloader, ids_to_words):
     score = float(compute_bleu(targets, preds, max_order=4)[0])
     print(f"BLEU score: {score}\n")
     return score
-
 
 words_to_ids, ids_to_words = get_vocab(VOCAB_PATH)
 train_dataset = IterMTDataset(SRC_TRAIN_PATH, TGT_TRAIN_PATH, words_to_ids)
