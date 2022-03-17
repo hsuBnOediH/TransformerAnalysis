@@ -1,18 +1,15 @@
 import collections
 import math
-import pickle
 
 import numpy as np
 import torch.cuda
-import os
-from tqdm import trange, tqdm
-from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from torch.utils.data import DataLoader, IterableDataset
 from transformers import BartConfig, AdamW
 
 from model_bart import BartForConditionalGeneration
 
 IS_DEBUG = True
-RELOAD_DATA = False
 DATASET = "TED"
 SRC_LANG = "en"
 TGT_LANG = "de"
@@ -30,7 +27,7 @@ LR = 0.0005
 MAX_POS_EMBEDDING = 128
 WARMUP_STEPS = 4000
 PRINT_STEP = 10 if IS_DEBUG else 100
-EVAL_STEP = 10 if IS_DEBUG else 1000
+EVAL_STEP = 10 if IS_DEBUG else 3000
 
 DATA_PATH = "data/" + DATASET + "/"
 VOCAB_PATH = DATA_PATH + "vocab"
@@ -40,6 +37,32 @@ SRC_TEST_PATH = DATA_PATH + "test." + SRC_LANG
 TGT_TEST_PATH = DATA_PATH + "test." + TGT_LANG
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def self_collate_fn(batch):
+    batch_max_length = 0
+    for sample in batch:
+        for ndarray in sample:
+            batch_max_length = max(ndarray.size, batch_max_length)
+
+    batch_max_length = min(MAX_LENGTH, batch_max_length)
+    encoder_input_ids = torch.zeros((len(batch), batch_max_length))
+    encoder_attention_mask = torch.zeros((len(batch), batch_max_length))
+    decoder_input_ids = torch.zeros((len(batch), batch_max_length))
+    decoder_attention_mask = torch.zeros((len(batch), batch_max_length))
+    label_ids = torch.zeros((len(batch), batch_max_length))
+    for i in range(len(batch)):
+        encoder_input_ids[i] = torch.cat(
+            [torch.from_numpy(batch[i][0]), torch.zeros((batch_max_length - batch[i][0].size))])
+        encoder_attention_mask[i] = torch.cat(
+            [torch.ones(batch[i][0].size), torch.zeros((batch_max_length - batch[i][0].size))])
+        decoder_input_ids[i] = torch.cat(
+            [torch.from_numpy(batch[i][1]), torch.zeros((batch_max_length - batch[i][1].size))])
+        decoder_attention_mask[i] = torch.cat(
+            [torch.ones(batch[i][1].size), torch.zeros((batch_max_length - batch[i][1].size))])
+        label_ids[i] = torch.cat([torch.from_numpy(batch[i][2]), torch.zeros((batch_max_length - batch[i][2].size))])
+
+    return encoder_input_ids.long(), encoder_attention_mask.long(), decoder_input_ids.long(), decoder_attention_mask.long(), label_ids.long()
 
 
 def _get_ngrams(segment, max_order):
@@ -132,103 +155,84 @@ def get_vocab(VOCAB_PATH):
     return v2id, id2v
 
 
-def process_data(source_file_path, target_file_path, word_to_ids,reload_data = False):
-    dataset = []
-    pickle_file_name = source_file_path.split('/')[-1].split('.')[0]
-    pickle_file_path = DATA_PATH + pickle_file_name + "_cache"
+class IterMTDataset(IterableDataset):
+    def __init__(self, src_file_path: str, tgt_file_path: str, words_to_ids):
+        super(IterMTDataset).__init__()
+        self.src_file_path = src_file_path
+        self.tgt_file_path = tgt_file_path
+        self.start, self.end = self.get_file_start_end()
+        self.words_to_ids = words_to_ids
 
-    if os.path.exists(pickle_file_path) and not reload_data:
-        with open(pickle_file_path, "rb") as fr:
-            dataset = pickle.load(fr)
-            return dataset
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            iter_start = self.start
+            iter_end = self.end
+        else:
+            per_worker_num = math.ceil((self.end - self.start) / worker_info.nums_workers)
+            worker_id = worker_info.id
+            iter_start = self.start + worker_id * per_worker_num
+            iter_end = min(iter_start + per_worker_num, self.end)
 
-    with open(source_file_path, "r") as source_file_reader, open(target_file_path, "r") as target_file_reader:
-        src_docs = source_file_reader.readlines()
-        tgt_docs = target_file_reader.readlines()
-        assert len(src_docs) == len(tgt_docs)
+        return self._sample_generator(iter_start, iter_end)
 
-        for i in trange(len(src_docs)):
-            src_doc = src_docs[i][:-1]
-            tgt_doc = tgt_docs[i][:-1]
+    def get_file_start_end(self):
+        src_file_path = self.src_file_path
+        tgt_file_path = self.tgt_file_path
+        start = 0
+        src_end = 0
+        tgt_end = 0
+        with open(src_file_path, "r") as src_fr, open(tgt_file_path, "r") as tgt_fr:
+            for _ in enumerate(src_fr):
+                src_end += 1
+            for _ in enumerate(tgt_fr):
+                tgt_end += 1
+            assert src_end == tgt_end
+        return start, src_end
 
-            src_sentences = src_doc.split("</s>")
-            tgt_sentences = tgt_doc.split("</s>")
-            for (src_sentence, tgt_sentence) in zip(src_sentences, tgt_sentences):
-                encoder_tokens = src_sentence.split()
-                decoder_tokens = tgt_sentence.split()
+    def _sample_generator(self, start, end):
+        words_to_ids = self.words_to_ids
+        with open(self.src_file_path, "r") as src_fr, open(self.tgt_file_path, "r") as tgt_fr:
+            for i, (src_line, tgt_line) in enumerate(zip(src_fr, tgt_fr)):
+                if i < start: continue
+                if i >= end: return StopIteration()
+                src_line = src_line[:-1]
+                tgt_line = tgt_line[:-1]
+                src_tokens = src_line.split()
+                tgt_tokens = tgt_line.split()
+                encoder_tokens = ["[CLS]"] + src_tokens + ["[SEP]"]
+                decoder_tokens = ["[CLS]"] + tgt_tokens + ["[SEP]"]
 
-                # truncate if too much token
-                # if len(encoder_tokens) > MAX_LENGTH - 2:
-                #     encoder_tokens = encoder_tokens[:MAX_LENGTH - 2]
-                # if len(decoder_tokens) > MAX_LENGTH - 2:
-                #     decoder_tokens = decoder_tokens[:MAX_LENGTH - 2]
-                # add [cls] and [sep]
-                encoder_tokens = ["[CLS]"] + encoder_tokens + ["[SEP]"]
-                decoder_tokens = ["[CLS]"] + decoder_tokens + ["[SEP]"]
+                encoder_input_ids = []
+                decoder_input_ids = []
 
-                encoder_input_id = []
-                decoder_input_id = []
-
-                for token in encoder_tokens:
-                    if token not in word_to_ids:
-                        print(f"[UNK TOKEN] : {token}")
-                        continue
-                    encoder_input_id.append(word_to_ids[token])
-
-                for token in decoder_tokens:
-                    if token not in word_to_ids:
-                        print(f"[UNK TOKEN] : {token}")
-                        continue
-                    decoder_input_id.append(word_to_ids[token])
-
-                # the last token not need to be input into model
-                last_token = decoder_input_id[-1]
-                decoder_input_id = decoder_input_id[:-1]
-
-                encoder_attention_mask = [1 for _ in encoder_input_id]
-                decoder_attention_mask = [1 for _ in decoder_input_id]
-                # the first token of decoder don't need to be predicted
-                label_id = decoder_input_id[1:]
-                label_id.append(last_token)
-
-                if len(encoder_input_id) > MAX_LENGTH or len(decoder_input_id) > MAX_LENGTH:
+                if len(encoder_tokens) > MAX_LENGTH or len(decoder_tokens) > MAX_LENGTH:
                     continue
 
-                while len(encoder_input_id) < MAX_LENGTH:
-                    # encoder_tokens.append("[PAD]")
-                    encoder_input_id.append(0)
-                    encoder_attention_mask.append(0)
-                while len(decoder_input_id) < MAX_LENGTH:
-                    # decoder_tokens.append("[PAD]")
-                    decoder_input_id.append(0)
-                    decoder_attention_mask.append(0)
-                    label_id.append(-100)
-                dataset.append({
-                    "encoder_input_id": np.array(encoder_input_id),
-                    "encoder_attention_mask": np.array(encoder_attention_mask),
-                    "decoder_input_id": np.array(decoder_input_id),
-                    "decoder_attention_mask": np.array(decoder_attention_mask),
-                    "label_id": np.array(label_id)
-                })
-    with open(pickle_file_path, 'wb') as fw:
-        pickle.dump(dataset, fw)
-    return dataset
+                for token in encoder_tokens:
+                    if token not in words_to_ids:
+                        print(f"[UNK TOKEN] : {token}")
+                        continue
+                    encoder_input_ids.append(words_to_ids[token])
 
+                for token in decoder_tokens:
+                    if token not in words_to_ids:
+                        print(f"[UNK TOKEN] : {token}")
+                        continue
+                    decoder_input_ids.append(words_to_ids[token])
 
-class MTDataset(Dataset):
-    def __init__(self, ds):
-        self.dataset = ds
+                label_ids = decoder_input_ids[1:]
+                decoder_input_ids = decoder_input_ids[:-1]
 
-    def __getitem__(self, item):
-        return self.dataset[item]
+                sample = [
+                    np.array(encoder_input_ids),
+                    np.array(decoder_input_ids),
+                    np.array(label_ids)
+                ]
+                yield sample
 
     def __len__(self):
-        return len(self.dataset)
-
-    #TODO collect fn torch Dataset bucketing batch op
-
-
-
+        return self.end - self.start
 
 
 class ReverseSqrtScheduler:
@@ -259,114 +263,71 @@ class ReverseSqrtScheduler:
             param_group['lr'] = lr[i]
 
 
-def eval_the_model(model, test_data_loader, ids_to_words, toy_test_dataloader=None, is_debug=False):
-    END_OF_SENTENCE = 2
-    START_OF_SENTENCE = 1
-    h_l = []
-    y_l = []
-    if is_debug:
-        with torch.no_grad():
-            model.eval()
 
-            for batch in tqdm(toy_test_dataloader):
-                encoder_input_id = batch["encoder_input_id"].to(device)
-                encoder_attention_mask = batch["encoder_attention_mask"].to(device)
-                label_id = batch["label_id"].to(device)
+def eval_the_model(model, test_dataloader, ids_to_words):
+    eos = 2  # tokenizer.sep_token_id
+    sos = 1  # tokenizer.cls_token_id
 
-                outputs = model.generate(
-                    input_ids=encoder_input_id,
-                    attention_mask=encoder_attention_mask,
-                    bos_token_id=START_OF_SENTENCE,
-                    num_return_sequences=1,
-                    num_beams=5,
-                    max_length=MAX_LENGTH,
-                    use_cache=True
-                )
-                outputs = outputs.to("cpu").tolist()
-                assert len(outputs) == len(label_id)
+    preds = []
+    targets = []
+    with torch.no_grad():
+        model.eval()
+        for batch in tqdm(test_dataloader):
 
-                for i in range(len(outputs)):
-                    predict = outputs[i]
-                    if END_OF_SENTENCE in predict:
-                        index = predict.index(END_OF_SENTENCE)
-                        predict = predict[:index]
-                    predict_tokens = []
-                    for _id in predict[1:]:
-                        predict_tokens.append(ids_to_words[_id])
-                    predict_str = " ".join(predict_tokens)
-                    predict_str = predict_str.replace("@@ ", "")
+            encoder_input_ids, encoder_attention_mask, decoder_input_ids, decoder_attention_mask, label_ids = batch
 
-                    target = label_id[i]
-                    target = target.to("cpu").tolist()
-                    index = target.index(END_OF_SENTENCE)
-                    target = target[:index]
-                    target_tokens = []
-                    for _id in target:
-                        target_tokens.append(ids_to_words[_id])
-                    target_str = " ".join(target_tokens)
-                    target_str = target_str.replace("@@ ", "")
+            src_input_ids = encoder_input_ids.to(device)
+            src_attention_mask = encoder_attention_mask.to(device)
+            tgt_input_ids = torch.zeros((decoder_input_ids.size()[0], 1)).to(device).long() + sos
+            tgt_label_ids = label_ids.to(device).tolist()
 
-                    h_l.append(predict_str.split())
-                    y_l.append([target_str.split()])
-        model.train()
-        score = float(compute_bleu(y_l, h_l, 4, False)[0])
-        print(f"bleu score: {score}")
-    else:
-        with torch.no_grad():
-            model.eval()
-            for batch in tqdm(test_data_loader):
-                encoder_input_id = batch["encoder_input_id"].to(device)
-                encoder_attention_mask = batch["encoder_attention_mask"].to(device)
-                label_id = batch["label_id"].to(device)
+            outputs = model.generate(input_ids=src_input_ids,
+                                     attention_mask=src_attention_mask,
+                                     decoder_input_ids=tgt_input_ids,
+                                     bos_token_id=sos,
+                                     num_return_sequences=1,
+                                     num_beams=5,
+                                     max_length=MAX_LENGTH)  # use_cache=False)
+            outputs = outputs.cpu().tolist()
+            assert len(outputs) == len(tgt_label_ids)
 
-                outputs = model.generate(
-                    input_ids=encoder_input_id,
-                    attention_mask=encoder_attention_mask,
-                    bos_token_id=START_OF_SENTENCE,
-                    num_return_sequences=1,
-                    num_beams=5,
-                    max_length=MAX_LENGTH,
-                    use_cache=True
-                )
-                outputs = outputs.to("cpu").tolist()
-                assert len(outputs) == len(label_id)
+            for i in range(len(outputs)):
+                pred = outputs[i]
+                if eos in pred:
+                    index = pred.index(eos)
+                    pred = pred[:index]
 
-                for i in range(len(outputs)):
-                    predict = outputs[i]
-                    if END_OF_SENTENCE in predict:
-                        index = predict.index(END_OF_SENTENCE)
-                        predict = predict[:index]
-                    predict_tokens = []
-                    for _id in predict[1:]:
-                        predict_tokens.append(ids_to_words[_id])
-                    predict_str = " ".join(predict_tokens)
-                    predict_str = predict_str.replace("@@", "")
+                pred_list = []
+                for _id in pred[1:]:
+                    pred_list.append(ids_to_words[_id])
+                pred_str = " ".join(pred_list)
+                pred_str = pred_str.replace("@@ ", "")
 
-                    target = label_id[i]
-                    target = target.to("cpu").tolist()
-                    index = target.index(END_OF_SENTENCE)
-                    target = target[:index]
-                    target_tokens = []
-                    for _id in target:
-                        target_tokens.append(ids_to_words[_id])
-                    target_str = " ".join(target_tokens)
-                    target_str = target_str.replace("@@", "")
+                target = tgt_label_ids[i]
+                index = target.index(eos)
+                target_list = []
+                for _id in target[:index]:
+                    target_list.append(ids_to_words[_id])
+                target_str = " ".join(target_list)
+                target_str = target_str.replace("@@ ", "")
 
-                    h_l.append(predict_str.split())
-                    y_l.append(target_str.split())
-        model.train()
-        score = float(compute_bleu(y_l, h_l, 4, False)[0])
-        print(f"bleu score: {score}")
+                preds.append(pred_str.split())
+                targets.append([target_str.split()])
 
+    model.train()
+    score = float(compute_bleu(targets, preds, max_order=4)[0])
+    print(f"BLEU score: {score}\n")
+    return score
 
 words_to_ids, ids_to_words = get_vocab(VOCAB_PATH)
-train_dataset = process_data(SRC_TRAIN_PATH, TGT_TRAIN_PATH, words_to_ids,reload_data=RELOAD_DATA)
-train_data_loader = DataLoader(dataset=MTDataset(train_dataset), shuffle=True, batch_size=BATCH_SIZE, pin_memory=True)
-test_dataset = process_data(SRC_TEST_PATH, TGT_TEST_PATH, words_to_ids,reload_data=RELOAD_DATA)
-test_data_loader = DataLoader(dataset=MTDataset(test_dataset), shuffle=True, batch_size=BATCH_SIZE, pin_memory=True)
-toy_test_dataset = test_dataset[:20]
-toy_test_dataloader = DataLoader(dataset=MTDataset(toy_test_dataset), shuffle=True, batch_size=BATCH_SIZE,
-                                 pin_memory=True)
+train_dataset = IterMTDataset(SRC_TRAIN_PATH, TGT_TRAIN_PATH, words_to_ids)
+train_dataloader = DataLoader(dataset=train_dataset, shuffle=False, batch_size=BATCH_SIZE, collate_fn=self_collate_fn,
+                              pin_memory=True)
+
+test_dataset = IterMTDataset(SRC_TEST_PATH, TGT_TEST_PATH, words_to_ids)
+test_dataloader = DataLoader(dataset=test_dataset, shuffle=False, batch_size=BATCH_SIZE, collate_fn=self_collate_fn,
+                             pin_memory=True)
+
 config = BartConfig(
     vocab_size=len(words_to_ids),
     d_model=EMBEDDING_SIZE,
@@ -395,30 +356,26 @@ for epoch in range(0, 100):
     total_loss = 0
     update_step = 0
 
-    for batch in tqdm(train_data_loader):
-        encoder_input_id = batch["encoder_input_id"].to(device)
-        encoder_attention_mask = batch["encoder_attention_mask"].to(device)
-        decoder_input_id = batch["decoder_input_id"].to(device)
-        decoder_attention_mask = batch["decoder_attention_mask"].to(device)
-        label_id = batch["label_id"].to(device)
+    for batch in tqdm(train_dataloader):
+        encoder_input_ids, encoder_attention_mask, decoder_input_ids, decoder_attention_mask, label_ids = batch
+        encoder_input_ids = encoder_input_ids.to(device)
+        encoder_attention_mask = encoder_attention_mask.to(device)
+        decoder_input_ids = decoder_input_ids.to(device)
+        decoder_attention_mask = decoder_attention_mask.to(device)
+        label_ids = label_ids.to(device)
 
-        # print(encoder_input_id, encoder_input_id.shape)
-        # print(encoder_attention_mask, encoder_attention_mask.shape)
-        # print(decoder_input_id,decoder_input_id.shape)
-        # print(decoder_attention_mask,decoder_attention_mask.shape)
-        # print(label_id,label_id.shape)
-        assert encoder_input_id.shape[-1] == 128
-        assert encoder_attention_mask.shape[-1] == 128
-        assert decoder_input_id.shape[-1] == 128
-        assert decoder_attention_mask.shape[-1] == 128
-        assert label_id.shape[-1] == 128
+        assert encoder_input_ids.shape[-1] == encoder_attention_mask.shape[-1]
+        assert decoder_input_ids.shape[-1] == encoder_input_ids.shape[-1]
+        assert decoder_attention_mask.shape[-1] == encoder_input_ids.shape[-1]
+        assert label_ids.shape[-1] == encoder_input_ids.shape[-1]
+        assert encoder_input_ids.shape[-1] <= MAX_LENGTH
 
         loss = model(
-            input_ids=encoder_input_id,
+            input_ids=encoder_input_ids,
             attention_mask=encoder_attention_mask,
-            decoder_input_ids=decoder_input_id,
+            decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
-            labels=label_id
+            labels=label_ids
         )["loss"]
         total_loss += loss.item()
         loss.backward()
@@ -426,8 +383,8 @@ for epoch in range(0, 100):
         scheduler.zero_grad()
         update_step += 1
         if update_step % PRINT_STEP == 0:
-            print(f"loss: {total_loss / update_step}")
+            print(f"\nloss: {total_loss / update_step}")
         if update_step % EVAL_STEP == 0:
-            eval_the_model(model, test_data_loader, ids_to_words, toy_test_dataloader,is_debug=IS_DEBUG )
+            eval_the_model(model, test_dataloader, ids_to_words)
 
-    eval_the_model(model, test_data_loader, ids_to_words)
+    eval_the_model(model, test_dataloader, ids_to_words)
