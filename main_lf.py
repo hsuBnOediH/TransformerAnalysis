@@ -143,7 +143,6 @@ def compute_bleu(reference_corpus, translation_corpus, max_order=4,
     bleu = geo_mean * bp
     return bleu, precisions, bp, ratio, translation_length, reference_length
 
-
 def get_vocab(VOCAB_PATH):
     v2id = {}
     id2v = {}
