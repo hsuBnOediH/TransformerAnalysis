@@ -28,6 +28,7 @@ MAX_POS_EMBEDDING = 128
 WARMUP_STEPS = 4000
 PRINT_STEP = 10 if IS_DEBUG else 100
 EVAL_STEP = 10 if IS_DEBUG else 3000
+SKIP_CROSS_ATT = [True,True,True,False,False,False]
 
 DATA_PATH = "data/" + DATASET + "/"
 VOCAB_PATH = DATA_PATH + "vocab"
@@ -346,7 +347,7 @@ config = BartConfig(
     decoder_start_token_id=1
 )
 
-model = BartForConditionalGeneration(config)
+model = BartForConditionalGeneration(config,SKIP_CROSS_ATT)
 model.to(device)
 
 optimizer = AdamW(model.parameters(), lr=LR, betas=(0.9, 0.98))

@@ -347,8 +347,9 @@ class BartEncoderLayer(nn.Module):
 
 
 class BartDecoderLayer(nn.Module):
-    def __init__(self, config: BartConfig):
+    def __init__(self, config: BartConfig,skip_cross = False):
         super().__init__()
+        self.skip_cross = skip_cross
         self.embed_dim = config.d_model
 
         self.self_attn = BartAttention(
@@ -420,28 +421,29 @@ class BartDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
-        # Cross-Attention Block
-        cross_attn_present_key_value = None
-        cross_attn_weights = None
-        if encoder_hidden_states is not None:
-            residual = hidden_states
+        if not self.skip_cross:
+            # Cross-Attention Block
+            cross_attn_present_key_value = None
+            cross_attn_weights = None
+            if encoder_hidden_states is not None:
+                residual = hidden_states
 
-            # cross_attn cached key/values tuple is at positions 3,4 of present_key_value tuple
-            cross_attn_past_key_value = past_key_value[-2:] if past_key_value is not None else None
-            hidden_states, cross_attn_weights, cross_attn_present_key_value = self.encoder_attn(
-                hidden_states=hidden_states,
-                key_value_states=encoder_hidden_states,
-                attention_mask=encoder_attention_mask,
-                layer_head_mask=cross_attn_layer_head_mask,
-                past_key_value=cross_attn_past_key_value,
-                output_attentions=output_attentions,
-            )
-            hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-            hidden_states = residual + hidden_states
-            hidden_states = self.encoder_attn_layer_norm(hidden_states)
+                # cross_attn cached key/values tuple is at positions 3,4 of present_key_value tuple
+                cross_attn_past_key_value = past_key_value[-2:] if past_key_value is not None else None
+                hidden_states, cross_attn_weights, cross_attn_present_key_value = self.encoder_attn(
+                    hidden_states=hidden_states,
+                    key_value_states=encoder_hidden_states,
+                    attention_mask=encoder_attention_mask,
+                    layer_head_mask=cross_attn_layer_head_mask,
+                    past_key_value=cross_attn_past_key_value,
+                    output_attentions=output_attentions,
+                )
+                hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+                hidden_states = residual + hidden_states
+                hidden_states = self.encoder_attn_layer_norm(hidden_states)
 
-            # add cross-attn to positions 3,4 of present_key_value tuple
-            present_key_value = present_key_value + cross_attn_present_key_value
+                # add cross-attn to positions 3,4 of present_key_value tuple
+                present_key_value = present_key_value + cross_attn_present_key_value
 
         # Fully Connected
         residual = hidden_states
@@ -867,13 +869,16 @@ class BartDecoder(BartPretrainedModel):
         embed_tokens (nn.Embedding): output embedding
     """
 
-    def __init__(self, config: BartConfig, embed_tokens: Optional[nn.Embedding] = None):
+    def __init__(self, config: BartConfig, skip_cross_layer=None,embed_tokens: Optional[nn.Embedding] = None):
         super().__init__(config)
         self.dropout = config.dropout
         self.layerdrop = config.decoder_layerdrop
         self.padding_idx = config.pad_token_id
         self.max_target_positions = config.max_position_embeddings
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
+
+        if skip_cross_layer is None:
+            skip_cross_layer = [False for _ in range(config.decoder_layers)]
 
         if embed_tokens is not None:
             self.embed_tokens = embed_tokens
@@ -884,7 +889,10 @@ class BartDecoder(BartPretrainedModel):
             config.max_position_embeddings,
             config.d_model,
         )
-        self.layers = nn.ModuleList([BartDecoderLayer(config) for _ in range(config.decoder_layers)])
+        assert len(skip_cross_layer) == config.decoder_layers,f"unmatch len(skip_cross_layer): {len(skip_cross_layer)}" \
+                                                              f"and config.decoder_layers: {config.decoder_layers}"
+
+        self.layers = nn.ModuleList([BartDecoderLayer(config,skip_cross) for skip_cross in skip_cross_layer])
         self.layernorm_embedding = nn.LayerNorm(config.d_model)
 
         self.gradient_checkpointing = False
@@ -1136,14 +1144,14 @@ class BartDecoder(BartPretrainedModel):
     BART_START_DOCSTRING,
 )
 class BartModel(BartPretrainedModel):
-    def __init__(self, config: BartConfig):
+    def __init__(self, config: BartConfig,skip_cross_layer):
         super().__init__(config)
 
         padding_idx, vocab_size = config.pad_token_id, config.vocab_size
         self.shared = nn.Embedding(vocab_size, config.d_model, padding_idx)
 
         self.encoder = BartEncoder(config, self.shared)
-        self.decoder = BartDecoder(config, self.shared)
+        self.decoder = BartDecoder(config, skip_cross_layer =skip_cross_layer, embed_tokens =self.shared)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1266,9 +1274,9 @@ class BartForConditionalGeneration(BartPretrainedModel):
     base_model_prefix = "model"
     _keys_to_ignore_on_load_missing = [r"final_logits_bias", r"lm_head\.weight"]
 
-    def __init__(self, config: BartConfig):
+    def __init__(self, config: BartConfig,skip_cross_layer):
         super().__init__(config)
-        self.model = BartModel(config)
+        self.model = BartModel(config,skip_cross_layer)
         self.register_buffer("final_logits_bias", torch.zeros((1, self.model.shared.num_embeddings)))
         self.lm_head = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
 
